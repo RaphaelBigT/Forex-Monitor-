@@ -1,0 +1,10 @@
+{
+  "pairs": ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"],
+  "timeframe": "4h",
+  "stochastic": { "kPeriod": 5, "dPeriod": 3, "slowing": 3, "oversold": 20, "overbought": 80 },
+  "trend": { "minAdx": 25 },
+  "zones": { "required": true, "lookbackCandles": 3 },
+  "news": { "enabled": true, "minutesBefore": 60, "minutesAfter": 30 },
+  "notify": { "priority": 4 },
+  "skipWeekends": true
+}
