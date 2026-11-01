@@ -5,7 +5,7 @@
 - EUR/USD: 4999 candles, 2023-12-28 to 2026-11-01
 - GBP/USD: 4999 candles, 2023-12-29 to 2026-11-01
 - USD/JPY: 4999 candles, 2023-12-22 to 2026-11-01
-- XAU/USD: 4999 candles, 2024-02-09 to 2026-11-01
+- XAU/USD: 4999 candles, 2024-02-11 to 2026-11-01
 
 ## Rules tested
 
