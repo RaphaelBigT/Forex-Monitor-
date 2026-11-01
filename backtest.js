@@ -8,7 +8,7 @@
 */
 const fs = require("fs");
 const path = require("path");
-const { evaluate } = require("./signals");
+const { evaluate, trendInfo } = require("./signals");
 const { mergeConfig, parseT } = require("./monitor");
 
 const TF_MS = { "1h": 36e5, "4h": 144e5, "1day": 864e5 };
@@ -19,12 +19,15 @@ const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
 
 const DEFAULTS = {
   candles: 5000,          // history to download per pair (the free Twelve Data limit per request)
-  maxHoldCandles: 30,     // close the trade at the market after this many candles
+  maxHoldCandles: 30,     // close a fixed-target trade at the market after this many candles
+  trailHoldCandles: 60,   // trailing-exit trades are given longer to run
   stopBufferAtr: 0.25,    // stop sits this far beyond the zone, in ATR
   maxRiskAtr: 4,          // skip trades whose stop would be wider than this many ATR
   costAtr: 0.05,          // assumed spread and slippage per trade, in ATR
   targets: [1, 1.5, 2, 3],
-  mainTarget: 2
+  mainTarget: 2,
+  htfCandles: 1500,       // daily candles used for the higher-timeframe test
+  htfAdx: 25              // daily ADX needed for the stricter higher-timeframe row
 };
 
 /* ---------- data ---------- */
@@ -55,47 +58,134 @@ function sessionOf(ms, tf) {
   return h >= 23 || h < 7 ? "Asia" : h < 15 ? "London" : "New York";
 }
 
-// Plays one signal forward. Enters at the open of the candle after the signal.
+// Walks one trade forward candle by candle. Returns the result in R (before costs).
+// Fixed target: rr is set. Trailing exit: trailDist is set (price distance behind the best price so far).
+function walk(bars, i, long, entry, stop0, risk, last, rr, trailDist) {
+  let stop = stop0, extreme = entry;
+  const target = rr ? (long ? entry + rr * risk : entry - rr * risk) : null;
+  for (let k = i + 1; k <= last; k++) {
+    const c = bars[k];
+    if (long ? c.l <= stop : c.h >= stop) {                      // if a candle touches stop and target, the stop counts first
+      const fill = long ? Math.min(stop, c.o) : Math.max(stop, c.o);   // a gap past the stop fills at the worse price
+      return (long ? fill - entry : entry - fill) / risk;
+    }
+    if (target !== null && (long ? c.h >= target : c.l <= target)) return rr;
+    if (trailDist) {                                              // the trailing stop only moves in your favour, from the next candle on
+      if (long) { extreme = Math.max(extreme, c.h); stop = Math.max(stop, extreme - trailDist); }
+      else { extreme = Math.min(extreme, c.l); stop = Math.min(stop, extreme + trailDist); }
+    }
+    if (k === last) return (long ? c.c - entry : entry - c.c) / risk;
+  }
+}
+function zoneStop(z, long, entry, atr, o) {
+  return z ? (long ? z.low - o.stopBufferAtr * atr : z.high + o.stopBufferAtr * atr)
+           : (long ? entry - 1.5 * atr : entry + 1.5 * atr);
+}
+
+// Plays one signal forward with every target. Enters at the open of the candle after the signal.
 function simulate(bars, i, r, atr, o) {
-  const entryBar = bars[i + 1], long = r.signal === "bull", entry = entryBar.o;
+  const long = r.signal === "bull", entry = bars[i + 1].o;
   const z = r.hitZone || (long ? r.demand : r.supply);
-  const stop = z ? (long ? z.low - o.stopBufferAtr * atr : z.high + o.stopBufferAtr * atr)
-                 : (long ? entry - 1.5 * atr : entry + 1.5 * atr);
+  const stop = zoneStop(z, long, entry, atr, o);
   const risk = long ? entry - stop : stop - entry;
   if (!(risk > 0)) return { skip: "invalid" };
   if (risk > o.maxRiskAtr * atr) return { skip: "wide" };
   const last = i + o.maxHoldCandles;
   if (last > bars.length - 1) return { skip: "recent" };       // not enough later candles to judge
   const cost = o.costAtr * atr / risk, res = {};
-  for (const rr of o.targets) {
-    const target = long ? entry + rr * risk : entry - rr * risk;
-    let R = null;
-    for (let k = i + 1; k <= last && R === null; k++) {
-      const c = bars[k], stopHit = long ? c.l <= stop : c.h >= stop, tgtHit = long ? c.h >= target : c.l <= target;
-      if (stopHit) R = -1;                                    // if both are hit in one candle, assume the stop came first
-      else if (tgtHit) R = rr;
-      else if (k === last) R = (long ? c.c - entry : entry - c.c) / risk;
-    }
-    res[rr] = R - cost;
-  }
+  for (const rr of o.targets) res[rr] = walk(bars, i, long, entry, stop, risk, last, rr, 0) - cost;
   const zone = r.hitZone ? (r.hitZone.touches === 0 ? "fresh" : "tested") : "none";
   return { entry, stop, risk, riskAtr: risk / atr, res, zone };
 }
 
 function replay(bars, ev, o, tf, pair) {
-  const trades = [], skipped = { invalid: 0, wide: 0, recent: 0 };
+  const trades = [], signals = [], skipped = { invalid: 0, wide: 0, recent: 0 };
   for (let i = WINDOW - 1; i < bars.length - 1; i++) {
     const win = bars.slice(i - WINDOW + 1, i + 1);             // only candles up to and including i
     const r = evaluate(win, ev);
     if (!r || !r.signal) continue;
-    const sim = simulate(bars, i, r, atrOf(win), o);
+    const atr = atrOf(win);
+    signals.push({ pair, i, dir: r.signal, adx: r.adx, hitZone: r.hitZone, demand: r.demand, supply: r.supply, atr, entryMs: parseT(bars[i + 1].t) });
+    const sim = simulate(bars, i, r, atr, o);
     if (sim.skip) { skipped[sim.skip]++; continue; }
     const entryMs = parseT(bars[i + 1].t);
     trades.push({ pair, dir: r.signal === "bull" ? "Buy" : "Sell", signalT: r.t, entryT: bars[i + 1].t, entryMs,
       entry: sim.entry, stop: sim.stop, riskAtr: sim.riskAtr, adx: r.adx, zone: sim.zone, session: sessionOf(entryMs, tf), res: sim.res });
   }
-  return { trades, skipped };
+  return { trades, signals, skipped };
 }
+
+
+/* ---------- exit rules and higher-timeframe filter ---------- */
+const EXIT_RULES = [
+  { label: "Stop beyond the zone, 2R target (as above)", stop: "zone", target: 2 },
+  { label: "Stop 1.5 ATR, 2R target", stop: 1.5, target: 2 },
+  { label: "Stop 2 ATR, 2R target", stop: 2, target: 2 },
+  { label: "Stop 2 ATR, 3R target", stop: 2, target: 3 },
+  { label: "Stop 2 ATR, trailing 2 ATR, no target", stop: 2, trail: 2, holdMult: 2 },
+  { label: "Stop 3 ATR, trailing 3 ATR, no target", stop: 3, trail: 3, holdMult: 2 }
+];
+
+// Plays one signal with a chosen exit rule. A trailing stop only moves using candles that have already finished.
+function simulateExit(bars, sig, rule, o) {
+  const i = sig.i, long = sig.dir === "bull", atr = sig.atr, entry = bars[i + 1].o;
+  let stop0;
+  if (rule.stop === "zone") {
+    const z = sig.hitZone || (long ? sig.demand : sig.supply);
+    stop0 = z ? (long ? z.low - o.stopBufferAtr * atr : z.high + o.stopBufferAtr * atr) : (long ? entry - 1.5 * atr : entry + 1.5 * atr);
+  } else stop0 = long ? entry - rule.stop * atr : entry + rule.stop * atr;
+  const risk = long ? entry - stop0 : stop0 - entry;
+  if (!(risk > 0)) return { skip: "invalid" };
+  if (rule.stop === "zone" && risk > o.maxRiskAtr * atr) return { skip: "wide" };
+  const last = i + Math.round(o.maxHoldCandles * (rule.holdMult || 1));
+  if (last > bars.length - 1) return { skip: "recent" };
+  const target = rule.target ? (long ? entry + rule.target * risk : entry - rule.target * risk) : null;
+  let stop = stop0, extreme = entry, R = null;
+  for (let k = i + 1; k <= last && R === null; k++) {
+    const c = bars[k];
+    if (long ? c.l <= stop : c.h >= stop) {                    // the stop is checked first
+      const fill = long ? Math.min(stop, c.o) : Math.max(stop, c.o);   // a gap past the stop fills at the open
+      R = (long ? fill - entry : entry - fill) / risk;
+    } else if (target !== null && (long ? c.h >= target : c.l <= target)) R = rule.target;
+    else {
+      if (rule.trail) {
+        extreme = long ? Math.max(extreme, c.h) : Math.min(extreme, c.l);
+        const t = long ? extreme - rule.trail * atr : extreme + rule.trail * atr;
+        stop = long ? Math.max(stop, t) : Math.min(stop, t);
+      }
+      if (k === last) R = (long ? c.c - entry : entry - c.c) / risk;
+    }
+  }
+  return { R: R - o.costAtr * atr / risk };
+}
+
+// Daily trend as of the close of each day, using only candles up to that day.
+function dailyTrends(daily) {
+  const out = [];
+  for (let d = 59; d < daily.length; d++) {
+    const t = trendInfo(daily.slice(Math.max(0, d - WINDOW + 1), d + 1), 0);
+    out.push({ date: daily[d].t.slice(0, 10), dir: t ? t.dir : "none", adx: t ? t.adx : 0 });
+  }
+  return out;
+}
+function htfAt(trends, dateStr) {                              // the last day that closed strictly before dateStr
+  let lo = 0, hi = trends.length - 1, ans = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (trends[mid].date < dateStr) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+  return ans < 0 ? null : trends[ans];
+}
+function evalR(sigs, rule, o, barsOf, filter) {
+  const out = [];
+  for (const sig of sigs) {
+    if (filter && !filter(sig)) continue;
+    const sim = simulateExit(barsOf[sig.pair], sig, rule, o);
+    if (!sim.skip) out.push({ ms: sig.entryMs, R: sim.R });
+  }
+  return out.sort((a, b) => a.ms - b.ms).map(x => x.R);
+}
+function rowS(label, s) {                                       // a star marks samples that are too small to trust
+  return s.n ? `| ${label} | ${s.n}${s.n < 30 ? "*" : ""} | ${pct(s.winRate)} | ${sg(s.avgR)} | ${sg(s.totalR)} | ${pfS(s.pf)} | ${s.maxDD.toFixed(1)}R |` : `| ${label} | 0 | - | - | - | - | - |`;
+}
+const headS = first => `| ${first} | Trades | Win rate | Avg R | Total R | Profit factor | Worst dip |\n|---|---|---|---|---|---|---|`;
 
 /* ---------- statistics ---------- */
 function stats(rs) {                                           // rs: R results in time order
@@ -135,6 +225,54 @@ const VARIANTS = [
   ["Classic stochastic 14, 3, 3", { k: 14 }]
 ];
 
+
+function buildExtra({ tf, o, sigSets, barsOf, htf, htfNotes }) {
+  const L = [], rows = [], SETS = [["Your current rules (zones required)", sigSets[0]], ["Zones switched off (bigger sample)", sigSets[1]]];
+  const add = (set, label, s) => { rows.push({ label: `${set}: ${label}`, s }); return rowS(label, s); };
+  const hold = Math.round(o.maxHoldCandles * 2);
+
+  L.push("## Test 1: wider stops and trailing exits", "",
+    "The same signals, played with different exits. A stop of 2 ATR sits two average candle ranges from the entry, so ordinary movement is less likely to knock you out. A trailing exit moves the stop behind price as it moves your way and has no fixed target, so a winner can keep running. Trailing exits are allowed " + hold + " candles.",
+    "Fixed-target rows allow " + o.maxHoldCandles + " candles. In the zone-stop row, a signal with no zone nearby gets a 1.5 ATR stop, and a signal whose stop would be wider than " + o.maxRiskAtr + " ATR is skipped, so that row can have fewer trades than the others. A star means fewer than 30 trades, which is too few to trust.", "");
+  for (const [name, sigs] of SETS) {
+    L.push(`**${name}**`, "", headS("Exit"), ...EXIT_RULES.map(rule => add(name, rule.label, stats(evalR(sigs, rule, o, barsOf)))), "");
+  }
+
+  L.push("## Test 2: does the daily trend help?", "");
+  const have = Object.keys(htf);
+  if (tf === "1day") L.push("Not possible on daily candles, because there is no longer timeframe to check against. Run it on 4h or 1h.", "");
+  else if (!have.length) L.push("The daily candles could not be loaded, so this test was skipped.", ...htfNotes.map(n => "- " + n), "");
+  else {
+    const agree = strict => sig => {
+      const tr = htf[sig.pair]; if (!tr) return false;
+      const h = htfAt(tr, barsOf[sig.pair][sig.i].t.slice(0, 10));
+      if (!h) return false;
+      return h.dir === (sig.dir === "bull" ? "up" : "down") && (!strict || h.adx >= o.htfAdx);
+    };
+    const FILTERS = [["No daily filter", null], ["Daily trend agrees", agree(false)], [`Daily trend agrees and daily ADX at least ${o.htfAdx}`, agree(true)]];
+    const EXITS = [EXIT_RULES[0], EXIT_RULES[2], EXIT_RULES[4]];
+    L.push("A signal only counts when the daily trend, as of the previous day's close, points the same way: price above the daily 50 average and the 20 above the 50 for a buy, the reverse for a sell. The stricter row also needs a daily ADX of at least " + o.htfAdx + ". Only closed daily candles are used.", "");
+    htfNotes.forEach(n => L.push("- " + n));
+    if (htfNotes.length) L.push("");
+    for (const [name, sigs] of SETS) {
+      L.push(`**${name}**`, "", headS("Daily filter and exit"));
+      for (const [fl, fn] of FILTERS) for (const ex of EXITS) L.push(add(name, `${fl}, ${ex.label}`, stats(evalR(sigs, ex, o, barsOf, fn))));
+      L.push("");
+    }
+  }
+
+  const big = rows.filter(r => r.s.n >= 30);
+  L.push("## What stands out", "");
+  if (!big.length) L.push("- No row had 30 or more trades, so none of these results is solid enough to act on. Add more pairs to `config.json` under `backtest`, or run 1h as well, to get a bigger sample.");
+  else {
+    const best = big.reduce((a, b) => b.s.avgR > a.s.avgR ? b : a);
+    if (best.s.avgR <= 0) L.push(`- None of the rows with at least 30 trades made money after costs. The least bad was "${best.label}" at ${sg(best.s.avgR)}R per trade over ${best.s.n} trades.`);
+    else L.push(`- The best row with at least 30 trades was "${best.label}": ${sg(best.s.avgR)}R per trade over ${best.s.n} trades. It was picked from ${rows.length} rows, so some of that is luck. Test it again on 1h or 1day, or on more pairs, before believing it.`);
+  }
+  L.push("");
+  return L;
+}
+
 function buildReport(ctx) {
   const { tf, o, data, current, variantRows, baseEv } = ctx, main = o.mainTarget;
   const tfl = TF_LABEL[tf], all = current.all, L = [];
@@ -173,6 +311,7 @@ function buildReport(ctx) {
       row("Second half of the data", stats(rsOf(all.filter(t => t.entryMs >= mid), main))), "");
   }
   L.push(`## What if the rules were different? (${main}R target)`, "", head("Variation"), ...variantRows, "");
+  if (ctx.extra) L.push(...ctx.extra);
   L.push("## How to read this", "");
   const n = all.length, s = stats(rsOf(all, main));
   if (n < 30) L.push(`- Only ${n} trades. That is too few to trust. A lucky or unlucky streak can look like a pattern. Use the rows with more trades, a longer history or more pairs before drawing conclusions.`);
@@ -205,18 +344,38 @@ async function runBacktest({ config, bt, tf, key, fetchImpl, now, log, rateWaitM
   if (!series.length) throw new Error("No price history could be loaded. " + (data[0] && data[0].error ? data[0].error : ""));
 
   const firstMs = Math.min(...series.map(s => parseT(s.bars[WINDOW].t))), lastMs = Math.max(...series.map(s => parseT(s.bars[s.bars.length - 1].t)));
+  const barsOf = {}; series.forEach(s => { barsOf[s.pair] = s.bars; });
+  const sigSets = [[], []];                                    // 0: your current rules, 1: zones switched off (bigger sample)
   const variantRows = []; let current = null;
-  for (const [label, patch] of VARIANTS) {
-    const ev = { ...baseEv, ...patch }, all = [];
-    for (const s of series) all.push(...replay(s.bars, ev, o, tf, s.pair).trades);
+  for (let vi = 0; vi < VARIANTS.length; vi++) {
+    const [label, patch] = VARIANTS[vi], ev = { ...baseEv, ...patch }, all = [];
+    for (const s of series) {
+      const rp = replay(s.bars, ev, o, tf, s.pair);
+      all.push(...rp.trades);
+      if (vi < 2) sigSets[vi].push(...rp.signals);
+    }
     if (!current) current = { all };
     variantRows.push(row(label, stats(rsOf(all, o.mainTarget))));
     log(`${label}: ${all.length} trades.`);
   }
+
+  // daily trend for the higher-timeframe test (not possible when the test itself is on daily candles)
+  const htf = {}, htfNotes = [];
+  if (tf !== "1day") {
+    for (const s of series) {
+      await sleep(pauseMs);
+      try {
+        const d = await getBars(s.pair, "1day", o.htfCandles, key, fetchImpl, now, rateWaitMs);
+        if (d.length < 100) throw new Error("only " + d.length + " daily candles");
+        htf[s.pair] = dailyTrends(d);
+      } catch (e) { htfNotes.push(`${s.pair}: daily candles unavailable (${e.message}), so it is left out of the daily-trend rows.`); log(`${s.pair}: daily ERROR ${e.message}`); }
+    }
+  }
+  const extra = buildExtra({ tf, o, sigSets, barsOf, htf, htfNotes });
   const csv = ["pair,direction,signal_candle,entry_candle,entry,stop,risk_atr,adx,zone,session," + o.targets.map(r => "R_at_" + r + "x").join(",")]
     .concat(current.all.slice().sort(byTime).map(t => [t.pair, t.dir, t.signalT, t.entryT, t.entry.toFixed(5), t.stop.toFixed(5), t.riskAtr.toFixed(2), t.adx.toFixed(0), t.zone, t.session,
       ...o.targets.map(r => t.res[r].toFixed(2))].join(","))).join("\n") + "\n";
-  const report = buildReport({ tf, o, data, current, variantRows, baseEv, firstMs, lastMs });
+  const report = buildReport({ tf, o, data, current, variantRows, baseEv, firstMs, lastMs, extra });
   return { report, csv };
 }
 
@@ -244,4 +403,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { simulate, replay, stats, runBacktest, DEFAULTS, WINDOW };
+module.exports = { simulate, simulateExit, dailyTrends, htfAt, evalR, replay, stats, runBacktest, DEFAULTS, EXIT_RULES, WINDOW };
