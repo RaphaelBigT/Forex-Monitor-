@@ -88,13 +88,76 @@ R means one unit of risk. A result of +0.30 average R means you gained 0.3 times
 | Variation | Trades | Win rate | Avg R | Total R | Profit factor |
 |---|---|---|---|---|---|
 | Your current rules | 12 | 33% | -0.36 | -4.32 | 0.49 |
-| Zones switched off | 145 | 35% | -0.18 | -25.74 | 0.72 |
+| Zones switched off | 145 | 35% | -0.19 | -27.77 | 0.71 |
 | ADX minimum 20 | 14 | 29% | -0.46 | -6.39 | 0.39 |
 | ADX minimum 30 | 7 | 43% | -0.28 | -1.99 | 0.53 |
 | ADX minimum 35 | 3 | 33% | -0.05 | -0.14 | 0.93 |
 | Zone touched within 5 candles | 12 | 33% | -0.36 | -4.32 | 0.49 |
 | Stochastic levels 30 and 70 | 19 | 37% | -0.22 | -4.22 | 0.67 |
 | Classic stochastic 14, 3, 3 | 2 | 0% | -1.04 | -2.08 | 0.00 |
+
+## Test 1: wider stops and trailing exits
+
+The same signals, played with different exits. A stop of 2 ATR sits two average candle ranges from the entry, so ordinary movement is less likely to knock you out. A trailing exit moves the stop behind price as it moves your way and has no fixed target, so a winner can keep running. Trailing exits are allowed 60 candles.
+Fixed-target rows allow 30 candles. In the zone-stop row, a signal with no zone nearby gets a 1.5 ATR stop, and a signal whose stop would be wider than 4 ATR is skipped, so that row can have fewer trades than the others. A star means fewer than 30 trades, which is too few to trust.
+
+**Your current rules (zones required)**
+
+| Exit | Trades | Win rate | Avg R | Total R | Profit factor | Worst dip |
+|---|---|---|---|---|---|---|
+| Stop beyond the zone, 2R target (as above) | 12* | 33% | -0.36 | -4.32 | 0.49 | 6.4R |
+| Stop 1.5 ATR, 2R target | 13* | 31% | -0.11 | -1.43 | 0.85 | 6.2R |
+| Stop 2 ATR, 2R target | 13* | 38% | -0.21 | -2.79 | 0.66 | 5.0R |
+| Stop 2 ATR, 3R target | 13* | 38% | -0.20 | -2.65 | 0.68 | 5.9R |
+| Stop 2 ATR, trailing 2 ATR, no target | 13* | 23% | -0.12 | -1.59 | 0.75 | 4.0R |
+| Stop 3 ATR, trailing 3 ATR, no target | 13* | 38% | -0.18 | -2.31 | 0.52 | 4.2R |
+
+**Zones switched off (bigger sample)**
+
+| Exit | Trades | Win rate | Avg R | Total R | Profit factor | Worst dip |
+|---|---|---|---|---|---|---|
+| Stop beyond the zone, 2R target (as above) | 145 | 35% | -0.19 | -27.77 | 0.71 | 48.9R |
+| Stop 1.5 ATR, 2R target | 243 | 35% | -0.04 | -9.63 | 0.94 | 45.8R |
+| Stop 2 ATR, 2R target | 243 | 37% | -0.05 | -12.80 | 0.91 | 42.2R |
+| Stop 2 ATR, 3R target | 243 | 35% | -0.07 | -17.53 | 0.88 | 45.3R |
+| Stop 2 ATR, trailing 2 ATR, no target | 241 | 36% | -0.05 | -11.04 | 0.88 | 33.0R |
+| Stop 3 ATR, trailing 3 ATR, no target | 241 | 36% | -0.05 | -11.41 | 0.88 | 33.6R |
+
+## Test 2: does the daily trend help?
+
+A signal only counts when the daily trend, as of the previous day's close, points the same way: price above the daily 50 average and the 20 above the 50 for a buy, the reverse for a sell. The stricter row also needs a daily ADX of at least 25. Only closed daily candles are used.
+
+**Your current rules (zones required)**
+
+| Daily filter and exit | Trades | Win rate | Avg R | Total R | Profit factor | Worst dip |
+|---|---|---|---|---|---|---|
+| No daily filter, Stop beyond the zone, 2R target (as above) | 12* | 33% | -0.36 | -4.32 | 0.49 | 6.4R |
+| No daily filter, Stop 2 ATR, 2R target | 13* | 38% | -0.21 | -2.79 | 0.66 | 5.0R |
+| No daily filter, Stop 2 ATR, trailing 2 ATR, no target | 13* | 23% | -0.12 | -1.59 | 0.75 | 4.0R |
+| Daily trend agrees, Stop beyond the zone, 2R target (as above) | 7* | 29% | -0.46 | -3.19 | 0.40 | 4.3R |
+| Daily trend agrees, Stop 2 ATR, 2R target | 8* | 38% | -0.22 | -1.73 | 0.66 | 4.0R |
+| Daily trend agrees, Stop 2 ATR, trailing 2 ATR, no target | 8* | 25% | -0.01 | -0.07 | 0.98 | 2.5R |
+| Daily trend agrees and daily ADX at least 25, Stop beyond the zone, 2R target (as above) | 3* | 33% | -0.63 | -1.90 | 0.11 | 2.1R |
+| Daily trend agrees and daily ADX at least 25, Stop 2 ATR, 2R target | 4* | 75% | +0.59 | +2.37 | 3.32 | 1.0R |
+| Daily trend agrees and daily ADX at least 25, Stop 2 ATR, trailing 2 ATR, no target | 4* | 25% | +0.31 | +1.23 | 1.71 | 1.1R |
+
+**Zones switched off (bigger sample)**
+
+| Daily filter and exit | Trades | Win rate | Avg R | Total R | Profit factor | Worst dip |
+|---|---|---|---|---|---|---|
+| No daily filter, Stop beyond the zone, 2R target (as above) | 145 | 35% | -0.19 | -27.77 | 0.71 | 48.9R |
+| No daily filter, Stop 2 ATR, 2R target | 243 | 37% | -0.05 | -12.80 | 0.91 | 42.2R |
+| No daily filter, Stop 2 ATR, trailing 2 ATR, no target | 241 | 36% | -0.05 | -11.04 | 0.88 | 33.0R |
+| Daily trend agrees, Stop beyond the zone, 2R target (as above) | 69 | 41% | -0.03 | -2.33 | 0.94 | 26.5R |
+| Daily trend agrees, Stop 2 ATR, 2R target | 136 | 36% | -0.07 | -9.18 | 0.89 | 31.4R |
+| Daily trend agrees, Stop 2 ATR, trailing 2 ATR, no target | 135 | 36% | -0.03 | -3.48 | 0.94 | 19.9R |
+| Daily trend agrees and daily ADX at least 25, Stop beyond the zone, 2R target (as above) | 38 | 47% | +0.10 | +3.95 | 1.19 | 13.5R |
+| Daily trend agrees and daily ADX at least 25, Stop 2 ATR, 2R target | 82 | 39% | +0.00 | +0.26 | 1.01 | 19.1R |
+| Daily trend agrees and daily ADX at least 25, Stop 2 ATR, trailing 2 ATR, no target | 81 | 36% | -0.00 | -0.32 | 0.99 | 12.8R |
+
+## What stands out
+
+- The best row with at least 30 trades was "Zones switched off (bigger sample): Daily trend agrees and daily ADX at least 25, Stop beyond the zone, 2R target (as above)": +0.10R per trade over 38 trades. It was picked from 30 rows, so some of that is luck. Test it again on 1h or 1day, or on more pairs, before believing it.
 
 ## How to read this
 
