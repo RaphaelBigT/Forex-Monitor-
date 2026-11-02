@@ -88,8 +88,101 @@ function findZones(bars) {
   return { list, atr: atrAt(n - 1) };
 }
 
+/* ---------- divergence ---------- */
+// A swing low (or high) is a candle whose low (high) is the lowest (highest) of the candles around it.
+// It is only confirmed after `right` more candles have closed, so nothing here looks into the future.
+function isPivot(bars, p, left, right, isLow) {
+  const f = isLow ? "l" : "h", v = bars[p][f];
+  if (p - left < 0 || p + right >= bars.length) return false;
+  for (let m = p - left; m <= p + right; m++) {
+    if (m === p) continue;
+    const x = bars[m][f];
+    if (isLow ? (m < p ? x <= v : x < v) : (m < p ? x >= v : x > v)) return false;
+  }
+  return true;
+}
+// the oscillator's most extreme reading in the three candles around a swing point
+function kNear(K, p, isLow) {
+  const v = [K[p - 1], K[p], K[p + 1]].filter(x => x != null);
+  return v.length ? (isLow ? Math.min(...v) : Math.max(...v)) : null;
+}
+/*
+  Looks for a divergence that is confirmed on the newest candle: the newest swing point is the one
+  `pivotRight` candles back, and it is compared with an earlier swing point of the same kind.
+  Regular bullish: price makes a lower low, %K makes a higher low (selling is losing strength).
+  Regular bearish: price makes a higher high, %K makes a lower high.
+  Hidden bullish: price makes a higher low, %K makes a lower low (a pullback in an uptrend is ending). Hidden bearish is the mirror.
+*/
+function findDivergence(bars, K, c, atr) {
+  const d = c.div, L = d.pivotLeft, R = d.pivotRight, i = bars.length - 1, p2 = i - R;
+  if (p2 - L < 0) return null;
+  for (const isLow of [true, false]) {
+    if (!isPivot(bars, p2, L, R, isLow)) continue;
+    const f = isLow ? "l" : "h", k2 = kNear(K, p2, isLow), pr2 = bars[p2][f];
+    if (k2 == null || (isLow ? k2 > 50 : k2 < 50)) continue;
+    for (let p1 = p2 - d.minBars; p1 >= Math.max(L, p2 - d.maxBars); p1--) {
+      if (!isPivot(bars, p1, L, R, isLow)) continue;
+      const pr1 = bars[p1][f], k1 = kNear(K, p1, isLow);
+      if (k1 == null || Math.abs(pr2 - pr1) < d.minPriceAtr * atr) continue;
+      let type = null;
+      if (isLow) { if (pr2 < pr1 && k2 >= k1 + d.minKDiff) type = "regular"; else if (pr2 > pr1 && k2 <= k1 - d.minKDiff) type = "hidden"; }
+      else { if (pr2 > pr1 && k2 <= k1 - d.minKDiff) type = "regular"; else if (pr2 < pr1 && k2 >= k1 + d.minKDiff) type = "hidden"; }
+      if (!type || !d.types.includes(type)) continue;
+      if (isLow ? Math.min(k1, k2) > c.os : Math.max(k1, k2) < c.ob) continue;          // one of the two readings must reach the extreme zone
+      let clean = true;                                                                 // price must not cut through the line joining the two swing points
+      for (let m = p1 + 1; m < p2 && clean; m++) {
+        const line = pr1 + (pr2 - pr1) * (m - p1) / (p2 - p1);
+        if (isLow ? bars[m].l < line : bars[m].h > line) clean = false;
+      }
+      if (!clean) continue;
+      return { kind: type, side: isLow ? "bull" : "bear", i1: p1, i2: p2, t1: bars[p1].t, t2: bars[p2].t, price1: pr1, price2: pr2, k1, k2 };
+    }
+  }
+  return null;
+}
+
+/* the trend filter and the zone filter, shared by both signal types */
+function applyFilters(out, bars, c, t, zr, recent) {
+  const mode = c.trendMode || "with";
+  if (out.signal && mode !== "off") {
+    const side = out.signal === "bull" ? "Buy" : "Sell", what = c.mode === "divergence" ? "divergence" : "signal";
+    if (!t || !t.trending) {
+      out.ignored = `${side} ${what} ignored: no clear trend, the market is consolidating (ADX ${t ? t.adx.toFixed(0) : "n/a"}).`;
+      out.signal = null;
+    } else if (mode === "with" && ((out.signal === "bull" && t.dir !== "up") || (out.signal === "bear" && t.dir !== "down"))) {
+      out.ignored = `${side} ${what} ignored: it points against the ${t.label.toLowerCase()}.`;
+      out.signal = null;
+    }
+  }
+  const tol = 0.25 * zr.atr, P = out.price, mid = z => (z.low + z.high) / 2;
+  const nearest = arr => arr.sort((x, y) => Math.abs(mid(x) - P) - Math.abs(mid(y) - P))[0] || null;
+  out.demand = nearest(zr.list.filter(z => z.type === "demand" && mid(z) <= P + tol));
+  out.supply = nearest(zr.list.filter(z => z.type === "supply" && mid(z) >= P - tol));
+  if (out.signal && c.zones) {
+    const want = out.signal === "bull" ? "demand" : "supply";
+    const hit = nearest(zr.list.filter(z => z.type === want && recent.some(x => x.l <= z.high + tol && x.h >= z.low - tol)));
+    if (!hit) {
+      out.ignored = `${out.signal === "bull" ? "Buy" : "Sell"} ${c.mode === "divergence" ? "divergence" : "signal"} ignored: price has not touched a ${want} zone ${c.mode === "divergence" ? "around the second swing point" : "in the last " + c.look + " candles"}.`;
+      out.signal = null;
+    } else out.hitZone = hit;
+  }
+}
+
 function evaluate(bars, c) {
   const { K, D } = stoch(bars, c.k, c.s, c.d), i = bars.length - 1;
+  if (c.mode === "divergence") {
+    if (i < 1 || K[i] == null || D[i] == null) return null;
+    const out = { k: K[i], d: D[i], price: bars[i].c, t: bars[i].t, signal: null };
+    out.zone = out.k <= c.os ? "Oversold" : out.k >= c.ob ? "Overbought" : "Neutral";
+    const t = trendInfo(bars, c.adx), zr = findZones(bars);
+    out.trend = t ? t.label : "Ranging";
+    out.adx = t ? t.adx : null;
+    const dv = findDivergence(bars, K, c, zr.atr);
+    if (dv) { out.div = dv; out.signal = dv.side; }
+    const recent = dv ? bars.slice(Math.max(0, dv.i2 - c.look + 1), dv.i2 + 1) : [];
+    applyFilters(out, bars, c, t, zr, recent);
+    return out;
+  }
   if (i < 1 || K[i] == null || D[i] == null || K[i - 1] == null || D[i - 1] == null) return null;
   const out = { k: K[i], d: D[i], price: bars[i].c, t: bars[i].t, signal: null };
   if (K[i - 1] <= D[i - 1] && K[i] > D[i] && Math.min(K[i - 1], K[i]) <= c.os) out.signal = "bull";
@@ -98,30 +191,17 @@ function evaluate(bars, c) {
   const t = trendInfo(bars, c.adx);
   out.trend = t ? t.label : "Ranging";
   out.adx = t ? t.adx : null;
-  if (out.signal) {
-    const side = out.signal === "bull" ? "Buy" : "Sell";
-    if (!t || !t.trending) {
-      out.ignored = `${side} signal ignored: no clear trend, the market is consolidating (ADX ${t ? t.adx.toFixed(0) : "n/a"}).`;
-      out.signal = null;
-    } else if ((out.signal === "bull" && t.dir !== "up") || (out.signal === "bear" && t.dir !== "down")) {
-      out.ignored = `${side} signal ignored: it points against the ${t.label.toLowerCase()}.`;
-      out.signal = null;
-    }
-  }
-  const zr = findZones(bars), tol = 0.25 * zr.atr, P = out.price, mid = z => (z.low + z.high) / 2;
-  const nearest = arr => arr.sort((x, y) => Math.abs(mid(x) - P) - Math.abs(mid(y) - P))[0] || null;
-  out.demand = nearest(zr.list.filter(z => z.type === "demand" && mid(z) <= P + tol));
-  out.supply = nearest(zr.list.filter(z => z.type === "supply" && mid(z) >= P - tol));
-  if (out.signal && c.zones) {
-    const want = out.signal === "bull" ? "demand" : "supply", recent = bars.slice(-c.look);
-    const hit = nearest(zr.list.filter(z => z.type === want && recent.some(x => x.l <= z.high + tol && x.h >= z.low - tol)));
-    if (!hit) {
-      out.ignored = `${out.signal === "bull" ? "Buy" : "Sell"} signal ignored: price has not touched a ${want} zone in the last ${c.look} candles.`;
-      out.signal = null;
-    } else out.hitZone = hit;
-  }
+  applyFilters(out, bars, c, t, findZones(bars), bars.slice(-c.look));
   return out;
 }
 
+/* turns config.json into the settings evaluate() takes */
+function evOf(config) {
+  const st = config.stochastic, dv = config.divergence || {};
+  return { mode: config.mode || "crossover", k: st.kPeriod, s: st.slowing, d: st.dPeriod, os: st.oversold, ob: st.overbought,
+    adx: config.trend.minAdx, trendMode: config.trend.mode || "with", zones: !!config.zones.required, look: config.zones.lookbackCandles,
+    div: { types: dv.types || ["regular"], pivotLeft: dv.pivotLeft || 3, pivotRight: dv.pivotRight || 2, minBars: dv.minBars || 5,
+           maxBars: dv.maxBars || 40, minKDiff: dv.minKDiff == null ? 3 : dv.minKDiff, minPriceAtr: dv.minPriceAtr == null ? 0.1 : dv.minPriceAtr } };
+}
 
-module.exports = { evaluate, findZones, trendInfo, stoch };
+module.exports = { evaluate, evOf, findDivergence, findZones, trendInfo, stoch };
