@@ -3,12 +3,12 @@
 /*
   Forex stochastic monitor.
   Runs on a schedule (GitHub Actions), checks your pairs and sends a phone alert through ntfy
-  when the stochastic gives a signal in a trending market, from a supply or demand zone,
-  with no high-impact news close by.
+  when the stochastic shows a divergence (or, if you switch the mode, a crossover) in a trending
+  market, at a supply or demand zone, with no high-impact news close by.
 */
 const fs = require("fs");
 const path = require("path");
-const { evaluate } = require("./signals");
+const { evaluate, evOf } = require("./signals");
 
 const TF_MS = { "1h": 36e5, "4h": 144e5, "1day": 864e5 };
 const TF_LABEL = { "1h": "1H", "4h": "4H", "1day": "Daily" };
@@ -19,8 +19,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const DEFAULTS = {
   pairs: ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"],
   timeframe: "4h",
+  mode: "divergence",
+  divergence: { types: ["regular"], pivotLeft: 3, pivotRight: 2, minBars: 5, maxBars: 40, minKDiff: 3, minPriceAtr: 0.1 },
   stochastic: { kPeriod: 5, dPeriod: 3, slowing: 3, oversold: 20, overbought: 80 },
-  trend: { minAdx: 25 },
+  trend: { minAdx: 25, mode: "trending" },
   zones: { required: true, lookbackCandles: 3 },
   news: { enabled: true, minutesBefore: 60, minutesAfter: 30 },
   notify: { priority: 4 },
@@ -37,6 +39,13 @@ function mergeConfig(user) {
   if (!Array.isArray(out.pairs) || !out.pairs.length || out.pairs.length > 10) throw new Error("config.json: 'pairs' needs between 1 and 10 pairs.");
   out.pairs.forEach(p => { if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(p)) throw new Error(`config.json: '${p}' is not a pair written like EUR/USD.`); });
   if (!TF_MS[out.timeframe]) throw new Error("config.json: 'timeframe' must be 1h, 4h or 1day.");
+  if (!["divergence", "crossover"].includes(out.mode)) throw new Error("config.json: 'mode' must be divergence or crossover.");
+  if (!["off", "trending", "with"].includes(out.trend.mode)) throw new Error("config.json: trend.mode must be off, trending or with.");
+  const dv = out.divergence;
+  if (!Array.isArray(dv.types) || !dv.types.length || dv.types.some(t => !["regular", "hidden"].includes(t))) throw new Error("config.json: divergence.types must list regular and/or hidden.");
+  ["pivotLeft", "pivotRight", "minBars", "maxBars"].forEach(k => { if (!(Number.isInteger(dv[k]) && dv[k] >= 1 && dv[k] <= 100)) throw new Error(`config.json: divergence.${k} must be a whole number from 1 to 100.`); });
+  if (dv.minBars <= dv.pivotRight || dv.minBars >= dv.maxBars) throw new Error("config.json: divergence.minBars must be above pivotRight and below maxBars.");
+  if (dv.maxBars + dv.pivotLeft + dv.pivotRight > 150) throw new Error("config.json: divergence.maxBars is too large for the 200 candles the monitor reads.");
   const pr = Number(out.notify.priority);
   if (!(pr >= 1 && pr <= 5)) throw new Error("config.json: notify.priority must be a number from 1 to 5.");
   out.notify.priority = pr;
@@ -108,11 +117,21 @@ function newsBlock(pair, n, events, now) {
 const fx = (v, price) => v.toFixed(price >= 500 ? 2 : price >= 50 ? 3 : 5);
 const zoneAge = z => z.touches ? "tested " + z.touches + "x" : "fresh";
 function buildText(r) {
+  const z = r.hitZone;
+  const zone = z ? ` Price reacted at a ${z.type} zone, ${fx(z.low, r.price)} to ${fx(z.high, r.price)} (${zoneAge(z)}).` : "";
+  const dv = r.div;
+  if (dv) {
+    const bull = dv.side === "bull", p = v => fx(v, r.price), k = v => v.toFixed(0);
+    const how = dv.kind === "regular"
+      ? (bull ? `Price made a lower low (${p(dv.price1)} then ${p(dv.price2)}) but %K made a higher low (${k(dv.k1)} then ${k(dv.k2)}), so selling pressure is fading.`
+              : `Price made a higher high (${p(dv.price1)} then ${p(dv.price2)}) but %K made a lower high (${k(dv.k1)} then ${k(dv.k2)}), so buying pressure is fading.`)
+      : (bull ? `Price made a higher low (${p(dv.price1)} then ${p(dv.price2)}) but %K made a lower low (${k(dv.k1)} then ${k(dv.k2)}), so the pullback looks finished.`
+              : `Price made a lower high (${p(dv.price1)} then ${p(dv.price2)}) but %K made a higher high (${k(dv.k1)} then ${k(dv.k2)}), so the bounce looks finished.`);
+    return `${bull ? "Bullish" : "Bearish"} ${dv.kind} divergence. ${how} Market: ${r.trend} (ADX ${r.adx.toFixed(0)}). The ${bull ? "swing low" : "swing high"} is ${p(dv.price2)}, the usual place for a stop is just beyond it.${zone}`;
+  }
   const base = r.signal === "bull"
     ? `${r.trend} (ADX ${r.adx.toFixed(0)}). The pullback looks over: %K crossed above %D from the oversold zone (K ${r.k.toFixed(1)}, D ${r.d.toFixed(1)}).`
     : `${r.trend} (ADX ${r.adx.toFixed(0)}). The bounce looks over: %K crossed below %D from the overbought zone (K ${r.k.toFixed(1)}, D ${r.d.toFixed(1)}).`;
-  const z = r.hitZone;
-  const zone = z ? ` Price reacted at a ${z.type} zone, ${fx(z.low, r.price)} to ${fx(z.high, r.price)} (${zoneAge(z)}).` : "";
   return base + zone;
 }
 const tvSymbol = pair => pair.startsWith("XAU") ? "OANDA:XAUUSD" : "FX:" + pair.replace("/", "");
@@ -139,8 +158,7 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
 
   const tf = config.timeframe, tfMs = TF_MS[tf], tfLabel = TF_LABEL[tf];
   const freshMs = Math.min(90, (tfMs / 6e4) * 0.75) * 6e4;           // ignore signals on candles that closed long ago
-  const ev = { k: config.stochastic.kPeriod, s: config.stochastic.slowing, d: config.stochastic.dPeriod, os: config.stochastic.oversold, ob: config.stochastic.overbought,
-               adx: config.trend.minAdx, zones: !!config.zones.required, look: config.zones.lookbackCandles };
+  const ev = evOf(config);
   const stateOf = p => state.pairs[p] && state.pairs[p].tf === tf ? state.pairs[p] : null;
 
   // only fetch a pair when a new closed candle should exist, so the free data limit is barely touched
@@ -162,7 +180,7 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
       log(`${pair} ${tfLabel} ${r.t} UTC | ${r.trend} ADX ${r.adx == null ? "-" : r.adx.toFixed(0)} | K ${r.k.toFixed(1)} D ${r.d.toFixed(1)} | ${r.signal ? "SIGNAL " + r.signal : (r.ignored || "no signal")}`);
 
       if (r.signal) {
-        const id = `${pair}|${tf}|${r.t}|${r.signal}`;
+        const id = `${pair}|${tf}|${r.t}|${r.signal}${r.div ? "|" + r.div.kind : ""}`;
         const side = r.signal === "bull" ? "Buy" : "Sell";
         if (state.seen.includes(id)) log(`${pair}: already alerted for this candle.`);
         else if (now - (startMs + tfMs) > freshMs) log(`${pair}: signal is too old to act on, skipped.`);
@@ -175,7 +193,7 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
           if (blocked) { state.seen.push(id); log(`${pair}: ${side} signal ignored: ${blocked}`); }
           else {
             await notify({
-              title: `${pair} ${tfLabel}: ${side} signal`,
+              title: r.div ? `${pair} ${tfLabel}: ${r.div.side === "bull" ? "Bullish" : "Bearish"} divergence` : `${pair} ${tfLabel}: ${side} signal`,
               message: `${buildText(r)} Price ${fx(r.price, r.price)}. Candle ${r.t} UTC.${note} Check the chart before trading.`,
               priority: config.notify.priority,
               tags: [r.signal === "bull" ? "chart_with_upwards_trend" : "chart_with_downwards_trend"],
