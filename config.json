@@ -1,10 +1,45 @@
 {
-  "pairs": ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"],
+  "pairs": [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "XAU/USD"
+  ],
   "timeframe": "4h",
-  "stochastic": { "kPeriod": 5, "dPeriod": 3, "slowing": 3, "oversold": 20, "overbought": 80 },
-  "trend": { "minAdx": 25 },
-  "zones": { "required": true, "lookbackCandles": 3 },
-  "news": { "enabled": true, "minutesBefore": 60, "minutesAfter": 30 },
-  "notify": { "priority": 4 },
+  "mode": "divergence",
+  "divergence": {
+    "types": [
+      "regular"
+    ],
+    "pivotLeft": 3,
+    "pivotRight": 2,
+    "minBars": 5,
+    "maxBars": 40,
+    "minKDiff": 3,
+    "minPriceAtr": 0.1
+  },
+  "stochastic": {
+    "kPeriod": 5,
+    "dPeriod": 3,
+    "slowing": 3,
+    "oversold": 20,
+    "overbought": 80
+  },
+  "trend": {
+    "minAdx": 25,
+    "mode": "trending"
+  },
+  "zones": {
+    "required": true,
+    "lookbackCandles": 3
+  },
+  "news": {
+    "enabled": true,
+    "minutesBefore": 60,
+    "minutesAfter": 30
+  },
+  "notify": {
+    "priority": 4
+  },
   "skipWeekends": true
 }
