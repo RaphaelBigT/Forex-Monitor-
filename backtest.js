@@ -8,7 +8,7 @@
 */
 const fs = require("fs");
 const path = require("path");
-const { evaluate, trendInfo } = require("./signals");
+const { evaluate, evOf, trendInfo } = require("./signals");
 const { mergeConfig, parseT } = require("./monitor");
 
 const TF_MS = { "1h": 36e5, "4h": 144e5, "1day": 864e5 };
@@ -77,7 +77,8 @@ function walk(bars, i, long, entry, stop0, risk, last, rr, trailDist) {
     if (k === last) return (long ? c.c - entry : entry - c.c) / risk;
   }
 }
-function zoneStop(z, long, entry, atr, o) {
+function zoneStop(z, long, entry, atr, o, div) {
+  if (div) return long ? div.price2 - o.stopBufferAtr * atr : div.price2 + o.stopBufferAtr * atr;   // divergence: just beyond the second swing point
   return z ? (long ? z.low - o.stopBufferAtr * atr : z.high + o.stopBufferAtr * atr)
            : (long ? entry - 1.5 * atr : entry + 1.5 * atr);
 }
@@ -86,7 +87,7 @@ function zoneStop(z, long, entry, atr, o) {
 function simulate(bars, i, r, atr, o) {
   const long = r.signal === "bull", entry = bars[i + 1].o;
   const z = r.hitZone || (long ? r.demand : r.supply);
-  const stop = zoneStop(z, long, entry, atr, o);
+  const stop = zoneStop(z, long, entry, atr, o, r.div);
   const risk = long ? entry - stop : stop - entry;
   if (!(risk > 0)) return { skip: "invalid" };
   if (risk > o.maxRiskAtr * atr) return { skip: "wide" };
@@ -105,11 +106,11 @@ function replay(bars, ev, o, tf, pair) {
     const r = evaluate(win, ev);
     if (!r || !r.signal) continue;
     const atr = atrOf(win);
-    signals.push({ pair, i, dir: r.signal, adx: r.adx, hitZone: r.hitZone, demand: r.demand, supply: r.supply, atr, entryMs: parseT(bars[i + 1].t) });
+    signals.push({ pair, i, dir: r.signal, div: r.div, adx: r.adx, hitZone: r.hitZone, demand: r.demand, supply: r.supply, atr, entryMs: parseT(bars[i + 1].t) });
     const sim = simulate(bars, i, r, atr, o);
     if (sim.skip) { skipped[sim.skip]++; continue; }
     const entryMs = parseT(bars[i + 1].t);
-    trades.push({ pair, dir: r.signal === "bull" ? "Buy" : "Sell", signalT: r.t, entryT: bars[i + 1].t, entryMs,
+    trades.push({ pair, dir: r.signal === "bull" ? "Buy" : "Sell", divKind: r.div ? r.div.kind : null, signalT: r.t, entryT: bars[i + 1].t, entryMs,
       entry: sim.entry, stop: sim.stop, riskAtr: sim.riskAtr, adx: r.adx, zone: sim.zone, session: sessionOf(entryMs, tf), res: sim.res });
   }
   return { trades, signals, skipped };
@@ -118,7 +119,7 @@ function replay(bars, ev, o, tf, pair) {
 
 /* ---------- exit rules and higher-timeframe filter ---------- */
 const EXIT_RULES = [
-  { label: "Stop beyond the zone, 2R target (as above)", stop: "zone", target: 2 },
+  { label: "Stop beyond the zone or swing point, 2R target (as above)", stop: "zone", target: 2 },
   { label: "Stop 1.5 ATR, 2R target", stop: 1.5, target: 2 },
   { label: "Stop 2 ATR, 2R target", stop: 2, target: 2 },
   { label: "Stop 2 ATR, 3R target", stop: 2, target: 3 },
@@ -132,7 +133,7 @@ function simulateExit(bars, sig, rule, o) {
   let stop0;
   if (rule.stop === "zone") {
     const z = sig.hitZone || (long ? sig.demand : sig.supply);
-    stop0 = z ? (long ? z.low - o.stopBufferAtr * atr : z.high + o.stopBufferAtr * atr) : (long ? entry - 1.5 * atr : entry + 1.5 * atr);
+    stop0 = zoneStop(z, long, entry, atr, o, sig.div);
   } else stop0 = long ? entry - rule.stop * atr : entry + rule.stop * atr;
   const risk = long ? entry - stop0 : stop0 - entry;
   if (!(risk > 0)) return { skip: "invalid" };
@@ -226,14 +227,35 @@ const VARIANTS = [
 ];
 
 
-function buildExtra({ tf, o, sigSets, barsOf, htf, htfNotes }) {
-  const L = [], rows = [], SETS = [["Your current rules (zones required)", sigSets[0]], ["Zones switched off (bigger sample)", sigSets[1]]];
+// divergence variations: each one changes one thing from your current settings
+function divVariants(b) {
+  const dv = patch => ({ div: { ...b.div, ...patch } });
+  return [
+    ["Your current rules", {}],
+    ["Zones switched off", { zones: false }],
+    ["Zones and trend filter both switched off", { zones: false, trendMode: "off" }],
+    ["Trend filter off, zones kept", { trendMode: "off" }],
+    ["Signal must point with the trend", { trendMode: "with" }],
+    ["Regular and hidden divergence", dv({ types: ["regular", "hidden"] })],
+    ["Hidden divergence only", dv({ types: ["hidden"] })],
+    ["Swing points need 2 candles each side", dv({ pivotLeft: 2, pivotRight: 2 })],
+    ["Swing points need 4 candles each side", dv({ pivotLeft: 4, pivotRight: 3 })],
+    ["Swing points at most 25 candles apart", dv({ maxBars: 25 })],
+    ["Stochastic levels 30 and 70", { os: 30, ob: 70 }],
+    ["Classic stochastic 14, 3, 3", { k: 14 }]
+  ];
+}
+
+function buildExtra({ tf, o, sigSets, sigNames, barsOf, htf, htfNotes, mode }) {
+  const L = [], rows = [], SETS = [[sigNames[0], sigSets[0]], [sigNames[1], sigSets[1]]];
   const add = (set, label, s) => { rows.push({ label: `${set}: ${label}`, s }); return rowS(label, s); };
   const hold = Math.round(o.maxHoldCandles * 2);
 
   L.push("## Test 1: wider stops and trailing exits", "",
     "The same signals, played with different exits. A stop of 2 ATR sits two average candle ranges from the entry, so ordinary movement is less likely to knock you out. A trailing exit moves the stop behind price as it moves your way and has no fixed target, so a winner can keep running. Trailing exits are allowed " + hold + " candles.",
-    "Fixed-target rows allow " + o.maxHoldCandles + " candles. In the zone-stop row, a signal with no zone nearby gets a 1.5 ATR stop, and a signal whose stop would be wider than " + o.maxRiskAtr + " ATR is skipped, so that row can have fewer trades than the others. A star means fewer than 30 trades, which is too few to trust.", "");
+    "Fixed-target rows allow " + o.maxHoldCandles + " candles. " + (mode === "divergence"
+      ? "In the first row the stop sits just beyond the second swing point of the divergence, and a signal whose stop would be wider than " + o.maxRiskAtr + " ATR is skipped, so that row can have fewer trades than the others."
+      : "In the zone-stop row, a signal with no zone nearby gets a 1.5 ATR stop, and a signal whose stop would be wider than " + o.maxRiskAtr + " ATR is skipped, so that row can have fewer trades than the others.") + " A star means fewer than 30 trades, which is too few to trust.", "");
   for (const [name, sigs] of SETS) {
     L.push(`**${name}**`, "", headS("Exit"), ...EXIT_RULES.map(rule => add(name, rule.label, stats(evalR(sigs, rule, o, barsOf)))), "");
   }
@@ -279,14 +301,19 @@ function buildReport(ctx) {
   L.push(`# Backtest: ${tfl} candles`, "");
   L.push("## Data", "");
   data.forEach(d => L.push(`- ${d.pair}: ${d.n} candles, ${d.from} to ${d.to}${d.error ? " (" + d.error + ")" : ""}`));
+  const div = baseEv.mode === "divergence", dvc = baseEv.div;
+  const trendLine = baseEv.trendMode === "off" ? "- Trend filter: off" : baseEv.trendMode === "with"
+    ? `- Trending market only: ADX at least ${baseEv.adx}, price on one side of the 20 and 50 averages, signal in the trend direction`
+    : `- Trending market only: ADX at least ${baseEv.adx} and price clearly on one side of the 20 and 50 averages (the signal may point either way)`;
   L.push("", "## Rules tested", "",
     `- Stochastic ${baseEv.k}, ${baseEv.s}, ${baseEv.d}, levels ${baseEv.os} and ${baseEv.ob}`,
-    `- Trending market only: ADX at least ${baseEv.adx}, price on one side of the 20 and 50 averages, signal in the trend direction`,
-    `- Zones: ${baseEv.zones ? `price must have touched a supply or demand zone in the last ${baseEv.look} candles` : "not required"}`,
+    ...(div ? [`- Signal: ${dvc.types.join(" and ")} divergence between price swing points and %K. A swing point needs ${dvc.pivotLeft} lower (or higher) candles before it and ${dvc.pivotRight} after it, so each signal appears ${dvc.pivotRight} candles after the second swing point, never earlier. The two swing points are ${dvc.minBars} to ${dvc.maxBars} candles apart, %K must differ by at least ${dvc.minKDiff} points, one of the two %K readings must reach the ${baseEv.os}/${baseEv.ob} zone, and price must not cut through the line joining the two swing points.`] : []),
+    trendLine,
+    `- Zones: ${baseEv.zones ? (div ? `price must have touched a supply or demand zone within ${baseEv.look} candles up to the second swing point` : `price must have touched a supply or demand zone in the last ${baseEv.look} candles`) : "not required"}`,
     "- Each signal uses only candles that had already closed when the signal appeared.", "",
     "## How each trade is played", "",
     "- Entry at the open of the candle after the signal.",
-    `- Stop ${o.stopBufferAtr} ATR beyond the zone. Trades with a stop wider than ${o.maxRiskAtr} ATR are skipped.`,
+    div ? `- Stop ${o.stopBufferAtr} ATR beyond the second swing point. Trades with a stop wider than ${o.maxRiskAtr} ATR are skipped.` : `- Stop ${o.stopBufferAtr} ATR beyond the zone. Trades with a stop wider than ${o.maxRiskAtr} ATR are skipped.`,
     `- Target at ${o.targets.join(", ")} times the risk (R). Each target is tested separately on the same trades.`,
     `- Closed at the market price after ${o.maxHoldCandles} candles if neither is hit.`,
     "- If a candle touches both the stop and the target, the stop is assumed to have been hit first.",
@@ -294,7 +321,7 @@ function buildReport(ctx) {
     "- The news filter is not included, because there is no free history of past news. The live monitor skips some trades this test counts.", "");
 
   if (!all.length) {
-    L.push("## Result", "", "The current rules produced no completed trades in this data. Try the \"Zones switched off\" row below, or a longer or different timeframe.", "");
+    L.push("## Result", "", "The current rules produced no completed trades in this data. Try the rows with fewer filters below, or a longer or different timeframe.", "");
   } else {
     L.push(`## Results for your current rules (${all.length} trades)`, "", head("Target"));
     o.targets.forEach(rr => L.push(row(`${rr}R target`, stats(rsOf(all, rr)))));
@@ -302,6 +329,7 @@ function buildReport(ctx) {
     L.push(`## Where it worked and where it did not (${main}R target)`, "");
     L.push("**By pair**", "", head("Pair"), group(all, t => t.pair, main), "");
     L.push("**By direction**", "", head("Direction"), group(all, t => t.dir, main), "");
+    if (baseEv.mode === "divergence") L.push("**By divergence type**", "", head("Type"), group(all, t => t.divKind, main), "");
     L.push("**By trend strength**", "", head("Trend strength"), group(all, adxBucket, main), "");
     L.push("**By zone**", "", head("Zone"), group(all, t => t.zone, main), "");
     if (tf !== "1day") L.push("**By session of entry**", "", head("Session"), group(all, t => t.session, main), "");
@@ -326,8 +354,9 @@ function buildReport(ctx) {
 async function runBacktest({ config, bt, tf, key, fetchImpl, now, log, rateWaitMs = 61000, pauseMs = 1200 }) {
   const o = { ...DEFAULTS, ...bt };
   if (!o.targets.includes(o.mainTarget)) o.targets.push(o.mainTarget);
-  const baseEv = { k: config.stochastic.kPeriod, s: config.stochastic.slowing, d: config.stochastic.dPeriod, os: config.stochastic.oversold,
-    ob: config.stochastic.overbought, adx: config.trend.minAdx, zones: !!config.zones.required, look: config.zones.lookbackCandles };
+  const baseEv = evOf(config), isDiv = baseEv.mode === "divergence";
+  const variants = isDiv ? divVariants(baseEv) : VARIANTS, setIdx = isDiv ? [0, 2] : [0, 1];   // the two signal sets used by the exit and daily-trend tests
+  const sigNames = isDiv ? ["Your current rules", "Zones and trend filter switched off (bigger sample)"] : ["Your current rules (zones required)", "Zones switched off (bigger sample)"];
 
   const data = [], series = [];
   for (let p = 0; p < config.pairs.length; p++) {
@@ -347,12 +376,12 @@ async function runBacktest({ config, bt, tf, key, fetchImpl, now, log, rateWaitM
   const barsOf = {}; series.forEach(s => { barsOf[s.pair] = s.bars; });
   const sigSets = [[], []];                                    // 0: your current rules, 1: zones switched off (bigger sample)
   const variantRows = []; let current = null;
-  for (let vi = 0; vi < VARIANTS.length; vi++) {
-    const [label, patch] = VARIANTS[vi], ev = { ...baseEv, ...patch }, all = [];
+  for (let vi = 0; vi < variants.length; vi++) {
+    const [label, patch] = variants[vi], ev = { ...baseEv, ...patch }, all = [];
     for (const s of series) {
       const rp = replay(s.bars, ev, o, tf, s.pair);
       all.push(...rp.trades);
-      if (vi < 2) sigSets[vi].push(...rp.signals);
+      if (setIdx.includes(vi)) sigSets[setIdx.indexOf(vi)].push(...rp.signals);
     }
     if (!current) current = { all };
     variantRows.push(row(label, stats(rsOf(all, o.mainTarget))));
@@ -371,7 +400,7 @@ async function runBacktest({ config, bt, tf, key, fetchImpl, now, log, rateWaitM
       } catch (e) { htfNotes.push(`${s.pair}: daily candles unavailable (${e.message}), so it is left out of the daily-trend rows.`); log(`${s.pair}: daily ERROR ${e.message}`); }
     }
   }
-  const extra = buildExtra({ tf, o, sigSets, barsOf, htf, htfNotes });
+  const extra = buildExtra({ tf, o, sigSets, sigNames, barsOf, htf, htfNotes, mode: baseEv.mode });
   const csv = ["pair,direction,signal_candle,entry_candle,entry,stop,risk_atr,adx,zone,session," + o.targets.map(r => "R_at_" + r + "x").join(",")]
     .concat(current.all.slice().sort(byTime).map(t => [t.pair, t.dir, t.signalT, t.entryT, t.entry.toFixed(5), t.stop.toFixed(5), t.riskAtr.toFixed(2), t.adx.toFixed(0), t.zone, t.session,
       ...o.targets.map(r => t.res[r].toFixed(2))].join(","))).join("\n") + "\n";
