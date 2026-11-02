@@ -3,9 +3,15 @@
     "EUR/USD",
     "GBP/USD",
     "USD/JPY",
-    "XAU/USD"
+    "XAU/USD",
+    "AUD/USD",
+    "USD/CAD",
+    "USD/CHF",
+    "NZD/USD",
+    "EUR/JPY",
+    "GBP/JPY"
   ],
-  "timeframe": "4h",
+  "timeframe": "1h",
   "mode": "divergence",
   "divergence": {
     "types": [
@@ -39,7 +45,8 @@
     "minutesAfter": 30
   },
   "notify": {
-    "priority": 4
+    "priority": 4,
+    "results": true
   },
   "skipWeekends": true,
   "backtest": {

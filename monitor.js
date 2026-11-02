@@ -25,7 +25,7 @@ const DEFAULTS = {
   trend: { minAdx: 25, mode: "trending" },
   zones: { required: true, lookbackCandles: 3 },
   news: { enabled: true, minutesBefore: 60, minutesAfter: 30 },
-  notify: { priority: 4 },
+  notify: { priority: 4, results: true },
   skipWeekends: true
 };
 
@@ -134,6 +134,56 @@ function buildText(r) {
     : `${r.trend} (ADX ${r.adx.toFixed(0)}). The bounce looks over: %K crossed below %D from the overbought zone (K ${r.k.toFixed(1)}, D ${r.d.toFixed(1)}).`;
   return base + zone;
 }
+/* ---------- results log ----------
+   Every divergence alert is followed forward with the same rules as the backtest (entry at the next candle's open,
+   stop just beyond the second swing point, target 2R, closed after 30 candles), so the live results can be compared
+   with the backtest. Nothing here places a trade. */
+const TRACK = { target: 2, maxHold: 30, bufferAtr: 0.25, maxRiskAtr: 4, costAtr: 0.05 };
+function atr14(bars) {
+  const trs = bars.map((b, i) => i === 0 ? b.h - b.l : Math.max(b.h - b.l, Math.abs(b.h - bars[i - 1].c), Math.abs(b.l - bars[i - 1].c))).slice(-14);
+  return trs.reduce((x, y) => x + y, 0) / trs.length;
+}
+function resolveTrade(t, bars) {
+  const k = bars.findIndex(b => b.t === t.signalT);
+  if (k < 0) return { status: "lost", how: "the alert candle is no longer in the data" };
+  const e = bars[k + 1];
+  if (!e) return { status: "open" };
+  const long = t.side === "bull", entry = e.o, stop = t.stop, risk = long ? entry - stop : stop - entry;
+  if (!(risk > 0)) return { status: "skipped", how: "the stop would be on the wrong side of the entry price" };
+  if (risk > TRACK.maxRiskAtr * t.atr) return { status: "skipped", how: "the stop would be wider than " + TRACK.maxRiskAtr + " average candle ranges" };
+  const target = long ? entry + TRACK.target * risk : entry - TRACK.target * risk, last = k + TRACK.maxHold;
+  for (let m = k + 1; m <= Math.min(last, bars.length - 1); m++) {
+    const c = bars[m];
+    let R = null, how;
+    if (long ? c.l <= stop : c.h >= stop) { const fill = long ? Math.min(stop, c.o) : Math.max(stop, c.o); R = (long ? fill - entry : entry - fill) / risk; how = "stopped out"; }
+    else if (long ? c.h >= target : c.l <= target) { R = TRACK.target; how = "target hit"; }
+    else if (m === last) { R = (long ? c.c - entry : entry - c.c) / risk; how = "closed after " + TRACK.maxHold + " candles"; }
+    if (R !== null) return { status: "closed", R: R - TRACK.costAtr * t.atr / risk, how, entry, closedT: c.t };
+  }
+  return { status: "open" };
+}
+const sgn = x => (x >= 0 ? "+" : "") + x.toFixed(2);
+function tallyText(trades) {
+  const c = trades.filter(t => t.status === "closed"), n = c.length, tot = c.reduce((a, t) => a + t.R, 0);
+  return `Closed alerts so far: ${n}, won ${c.filter(t => t.R > 0).length}, average ${sgn(tot / n)}R, total ${sgn(tot)}R.`;
+}
+async function updateTrades(state, pair, tf, bars, config, notify, log) {
+  for (const t of state.trades) {
+    if (t.pair !== pair || t.tf !== tf || t.status !== "open") continue;
+    const x = resolveTrade(t, bars);
+    if (x.status === "open") continue;
+    Object.assign(t, x);
+    log(`${pair}: tracked alert from ${t.signalT} UTC is ${x.status}${x.R === undefined ? " (" + x.how + ")" : ", " + x.how + " at " + sgn(x.R) + "R"}.`);
+    if (x.status === "closed" && config.notify.results) {
+      try {
+        await notify({ title: `Result: ${pair} ${TF_LABEL[tf]} ${t.side === "bull" ? "Buy" : "Sell"} alert`,
+          message: `The alert from ${t.signalT} UTC was ${x.how} at ${sgn(x.R)}R (entry ${fx(x.entry, x.entry)}, stop ${fx(t.stop, x.entry)}, 2R target). ${tallyText(state.trades)} This is a record of what the alert would have done, not a trade.`,
+          priority: 2, tags: [x.R > 0 ? "white_check_mark" : "x"] });
+      } catch (e) { log("Could not send the result notice: " + e.message); }
+    }
+  }
+}
+
 const tvSymbol = pair => pair.startsWith("XAU") ? "OANDA:XAUUSD" : "FX:" + pair.replace("/", "");
 
 async function sendNtfy(server, topic, n, fetchImpl) {
@@ -144,11 +194,11 @@ async function sendNtfy(server, topic, n, fetchImpl) {
 }
 
 /* ---------- one run ---------- */
-async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs = 61000, pauseMs = 1000 }) {
+async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs = 61000, pauseMs = 8000 }) {
   const res = { sent: 0, errors: [] };
   const server = env.NTFY_SERVER || "https://ntfy.sh";
   const notify = n => sendNtfy(server, env.NTFY_TOPIC, n, fetchImpl);
-  state.seen = state.seen || []; state.pairs = state.pairs || {};
+  state.seen = state.seen || []; state.pairs = state.pairs || {}; state.trades = state.trades || [];
 
   if (test) {
     await notify({ title: "Forex monitor test", message: "Your alerts are working. This is how a signal will arrive on your phone.", priority: config.notify.priority, tags: ["white_check_mark"] });
@@ -175,6 +225,7 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
       if (bars.length < 60) throw new Error("Not enough candles came back (" + bars.length + ")");
       const startMs = parseT(bars[bars.length - 1].t), ps = stateOf(pair);
       if (ps && ps.last && startMs <= ps.last) { log(`${pair}: no new ${tfLabel} candle yet.`); continue; }
+      await updateTrades(state, pair, tf, bars, config, notify, log);
       const r = evaluate(bars, ev);
       if (!r) throw new Error("Not enough data for the indicators");
       log(`${pair} ${tfLabel} ${r.t} UTC | ${r.trend} ADX ${r.adx == null ? "-" : r.adx.toFixed(0)} | K ${r.k.toFixed(1)} D ${r.d.toFixed(1)} | ${r.signal ? "SIGNAL " + r.signal : (r.ignored || "no signal")}`);
@@ -201,6 +252,11 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
             });
             state.seen.push(id); res.sent++;
             log(`${pair}: ${side} alert sent.`);
+            if (r.div) {
+              const a = atr14(bars);
+              state.trades.push({ id, pair, tf, side: r.signal, kind: r.div.kind, signalT: r.t, atr: a, status: "open",
+                stop: r.signal === "bull" ? r.div.price2 - TRACK.bufferAtr * a : r.div.price2 + TRACK.bufferAtr * a });
+            }
           }
         }
       }
@@ -211,6 +267,8 @@ async function run({ config, state, env, fetchImpl, now, log, test, rateWaitMs =
     }
   }
   if (state.seen.length > 300) state.seen = state.seen.slice(-300);
+  const open = state.trades.filter(t => t.status === "open"), done = state.trades.filter(t => t.status !== "open");
+  state.trades = done.slice(-400).concat(open);
 
   if (attempted > 0 && failed === attempted) {                // everything failed: tell the user, at most twice a day
     if (!state.lastError || now - state.lastError > 12 * 36e5) {
@@ -250,4 +308,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { run, mergeConfig, marketClosed, newsBlock, fetchBars, parseT };
+module.exports = { run, mergeConfig, marketClosed, newsBlock, fetchBars, parseT, resolveTrade, tallyText };
