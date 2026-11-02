@@ -41,5 +41,19 @@
   "notify": {
     "priority": 4
   },
-  "skipWeekends": true
+  "skipWeekends": true,
+  "backtest": {
+    "pairs": [
+      "EUR/USD",
+      "GBP/USD",
+      "USD/JPY",
+      "XAU/USD",
+      "AUD/USD",
+      "USD/CAD",
+      "USD/CHF",
+      "NZD/USD",
+      "EUR/JPY",
+      "GBP/JPY"
+    ]
+  }
 }
